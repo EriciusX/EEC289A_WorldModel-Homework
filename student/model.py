@@ -10,6 +10,20 @@ import torch
 from torch import nn
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
 class StudentWorldModel(nn.Module):
     def __init__(
         self,
@@ -23,14 +37,21 @@ class StudentWorldModel(nn.Module):
         super().__init__()
         self.use_gru = bool(use_gru)
         self.delta_limit = float(delta_limit)
-        in_dim = obs_dim + act_dim
-        layers: list[nn.Module] = []
-        for _ in range(int(num_layers)):
-            layers += [nn.Linear(in_dim, hidden_dim), nn.SiLU()]
-            in_dim = hidden_dim
-        self.encoder = nn.Sequential(*layers)
+        feature_dim = obs_dim + act_dim + obs_dim + act_dim + obs_dim * act_dim
+        self.input = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(int(num_layers))])
         self.gru = nn.GRUCell(hidden_dim, hidden_dim) if self.use_gru else None
-        self.head = nn.Linear(hidden_dim, obs_dim)
+        self.linear_head = nn.Linear(feature_dim, obs_dim)
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, obs_dim),
+        )
 
     def initial_hidden(self, batch_size: int, device: torch.device):
         if not self.use_gru:
@@ -38,12 +59,25 @@ class StudentWorldModel(nn.Module):
         return torch.zeros(batch_size, self.gru.hidden_size, device=device)
 
     def forward(self, obs_norm: torch.Tensor, act_norm: torch.Tensor, hidden=None):
-        feat = self.encoder(torch.cat([obs_norm, act_norm], dim=-1))
+        obs_act = obs_norm.unsqueeze(-1) * act_norm.unsqueeze(-2)
+        model_input = torch.cat(
+            [
+                obs_norm,
+                act_norm,
+                obs_norm * obs_norm,
+                act_norm * act_norm,
+                obs_act.flatten(start_dim=1),
+            ],
+            dim=-1,
+        )
+        feat = self.input(model_input)
+        for block in self.blocks:
+            feat = block(feat)
         if self.gru is not None:
             if hidden is None:
                 hidden = self.initial_hidden(obs_norm.shape[0], obs_norm.device)
             hidden = self.gru(feat, hidden)
             feat = hidden
-        raw_delta = self.head(feat)
+        raw_delta = self.linear_head(model_input) + self.head(feat)
         delta = self.delta_limit * torch.tanh(raw_delta / self.delta_limit)
         return delta, hidden

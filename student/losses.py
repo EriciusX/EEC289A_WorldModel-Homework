@@ -19,7 +19,19 @@ def one_step_delta_loss(model, states: torch.Tensor, actions: torch.Tensor, norm
     return F.mse_loss(pred_norm, target_norm)
 
 
-def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer, warmup_steps: int, horizon: int) -> torch.Tensor:
+def rollout_loss(
+    model,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    normalizer,
+    warmup_steps: int,
+    horizon: int,
+    *,
+    cvar_weight: float = 0.0,
+    cvar_fraction: float = 0.25,
+    threshold_weight: float = 0.0,
+    threshold: float = 0.25,
+) -> torch.Tensor:
     # Train local open-loop stability at random positions, not only at the
     # beginning of each stored window.
     needed_states = int(warmup_steps) + int(horizon) + 1
@@ -39,7 +51,20 @@ def rollout_loss(model, states: torch.Tensor, actions: torch.Tensor, normalizer,
     targets = sub_states[:, warmup_steps + 1 : warmup_steps + 1 + horizon]
     pred_norm = normalizer.normalize_obs(preds)
     target_norm = normalizer.normalize_obs(targets)
-    return F.mse_loss(pred_norm, target_norm)
+    per_window_step = torch.mean((pred_norm - target_norm) ** 2, dim=-1)
+    per_step = torch.mean(per_window_step, dim=0)
+    weights = torch.linspace(1.5, 1.0, steps=int(horizon), dtype=per_step.dtype, device=per_step.device)
+    weights = weights / weights.mean()
+    base = torch.sum(per_step * weights)
+    if cvar_weight > 0.0:
+        per_window_weighted = torch.mean(per_window_step * weights.view(1, -1), dim=1)
+        k = max(1, int(per_window_weighted.shape[0] * float(cvar_fraction)))
+        worst = torch.topk(per_window_weighted, k=k, largest=True).values.mean() * int(horizon)
+        base = base + float(cvar_weight) * worst
+    if threshold_weight > 0.0:
+        excess = F.relu(per_window_step - float(threshold))
+        base = base + float(threshold_weight) * torch.mean(excess * excess) * int(horizon)
+    return base
 
 
 def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
@@ -49,10 +74,43 @@ def compute_loss(model, batch: dict[str, torch.Tensor], normalizer, cfg: dict):
     one = one_step_delta_loss(model, states, actions, normalizer)
     horizon = int(loss_cfg.get("rollout_train_horizon", 5))
     warmup = int(cfg["eval"].get("warmup_steps", 5))
-    roll = rollout_loss(model, states, actions, normalizer, warmup_steps=warmup, horizon=horizon)
+    roll = rollout_loss(
+        model,
+        states,
+        actions,
+        normalizer,
+        warmup_steps=warmup,
+        horizon=horizon,
+        cvar_weight=float(loss_cfg.get("rollout_cvar_weight", 0.0)),
+        cvar_fraction=float(loss_cfg.get("rollout_cvar_fraction", 0.25)),
+        threshold_weight=float(loss_cfg.get("threshold_weight", 0.0)),
+        threshold=float(loss_cfg.get("threshold", 0.25)),
+    )
+    long_roll = None
+    long_horizon = int(loss_cfg.get("long_rollout_train_horizon", 0))
+    if long_horizon > 0:
+        long_roll = rollout_loss(
+            model,
+            states,
+            actions,
+            normalizer,
+            warmup_steps=warmup,
+            horizon=long_horizon,
+            cvar_weight=float(loss_cfg.get("long_rollout_cvar_weight", 0.0)),
+            cvar_fraction=float(loss_cfg.get("rollout_cvar_fraction", 0.25)),
+            threshold_weight=float(loss_cfg.get("long_threshold_weight", 0.0)),
+            threshold=float(loss_cfg.get("threshold", 0.25)),
+        )
     total = float(loss_cfg.get("one_step_weight", 1.0)) * one + float(loss_cfg.get("rollout_weight", 0.3)) * roll
-    return total, {
+    if long_roll is not None:
+        total = total + float(loss_cfg.get("long_rollout_weight", 0.0)) * long_roll
+    metrics = {
         "loss/total": float(total.detach().cpu()),
         "loss/one_step": float(one.detach().cpu()),
         "loss/rollout": float(roll.detach().cpu()),
+    }
+    if long_roll is not None:
+        metrics["loss/long_rollout"] = float(long_roll.detach().cpu())
+    return total, {
+        **metrics,
     }
