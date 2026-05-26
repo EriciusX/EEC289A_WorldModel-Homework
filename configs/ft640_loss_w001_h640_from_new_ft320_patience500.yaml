@@ -1,0 +1,42 @@
+seed: 289
+device: auto
+torch_num_threads: 1
+
+model:
+  architecture: residual_gru
+  activation: silu
+  hidden_dim: 256
+  num_layers: 4
+  use_gru: true
+
+training:
+  init_checkpoint_dir: artifacts/ft320_loss_w0045_h320_patience/best_checkpoint
+  batch_size: 128
+  max_updates: 8000
+  updates: 8000
+  smoke_updates: 40
+  min_updates: 1000
+  plateau_patience_updates: 500
+  train_sequence_length: 660
+  learning_rate: 1.0e-5
+  grad_clip_norm: 10.0
+  eval_every: 250
+  smoke_eval_every: 20
+  val_horizon: 1000
+  max_val_windows: 256
+  checkpoint_metric: val/VPT80@0.25
+  checkpoint_mode: max
+
+loss:
+  one_step_weight: 3.0
+  rollout_weight: 0.7
+  rollout_train_horizon: 25
+  long_rollout_weight: 0.001
+  long_rollout_train_horizon: 640
+
+eval:
+  warmup_steps: 10
+  horizon: auto
+  max_horizon: 1000
+  report_horizons: [1, 5, 10, 90, 100, 200, 500, 1000]
+  vpt_thresholds: [0.10, 0.25, 0.50]
